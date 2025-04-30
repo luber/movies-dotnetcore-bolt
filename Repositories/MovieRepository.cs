@@ -1,11 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices.ComTypes;
 using System.Threading.Tasks;
 using MoviesDotNetCore.Model;
-using Neo4j.Driver;
+using Neo4jClient;
+using Neo4jClient.Cypher;
 
 namespace MoviesDotNetCore.Repositories;
 
@@ -19,107 +18,94 @@ public interface IMovieRepository
 
 public class MovieRepository : IMovieRepository
 {
-    private readonly IDriver _driver;
-    private readonly QueryConfig _queryConfig;
+    private readonly IGraphClient _client;
 
-    public MovieRepository(IDriver driver)
+    public MovieRepository(IGraphClient client)
     {
-        var versionStr = Environment.GetEnvironmentVariable("NEO4J_VERSION") ?? "";
-        if( double.TryParse(versionStr, out var version) && version >= 4.0)
-        {
-            _queryConfig = new QueryConfig(database: Environment.GetEnvironmentVariable("NEO4J_DATABASE") ?? "movies");
-        }
-        else
-        {
-            _queryConfig = new QueryConfig();
-        }
-
-        _driver = driver;
+        _client = client;
     }
-
+    
     public async Task<Movie> FindByTitle(string title)
     {
-        var (queryResults, _) = await _driver
-            .ExecutableQuery(@"
-                MATCH (movie:Movie {title:$title})
-                OPTIONAL MATCH (movie)<-[r]-(person:Person)
-                RETURN movie.title AS title,
-                       collect({
-                           name:person.name,
-                           job: head(split(toLower(type(r)),'_')),
-                           role: reduce(acc = '', role IN r.roles | acc + CASE WHEN acc='' THEN '' ELSE ', ' END + role)}
-                       ) AS cast")
-            .WithParameters(new { title })
-            .WithConfig(_queryConfig)
-            .ExecuteAsync();
+        var query = _client.Cypher
+            .Match("(movie:Movie {title:$title})")
+            .OptionalMatch("(movie)<-[r]-(person:Person)")
+            .WithParam("title", title)
+            .Return((movie, person, r) => new
+            {
+                Title = Return.As<string>("movie.title"),
+                Cast = Return.As<List<Dictionary<string, object>>>("collect({name:person.name, job: head(split(toLower(type(r)),'_')), role: r.roles})")
+            });
 
-        return queryResults
-            .Select(
-                record => new Movie(
-                    record["title"].As<string>(),
-                    MapCast(record["cast"].As<List<IDictionary<string, object>>>())))
-            .Single();
+        var result = await query.ResultsAsync;
+        var movieData = result.Single();
+
+        return new Movie(
+            movieData.Title,
+            MapCast(movieData.Cast));
     }
 
     public async Task<int> VoteByTitle(string title)
     {
-        var (_, summary) = await _driver
-            .ExecutableQuery(@"
-                MATCH (m:Movie {title: $title})
-                SET m.votes = coalesce(m.votes, 0) + 1")
-            .WithParameters(new { title })
-            .WithConfig(_queryConfig)
-            .ExecuteAsync();
+        var query = _client.Cypher
+            .Match("(m:Movie {title: $title})")
+            .WithParam("title", title)
+            .Set("m.votes = coalesce(m.votes, 0) + 1")
+            .Return(m => Return.As<int>("count(m)"));
 
-        return summary.Counters.PropertiesSet;
+        var result = await query.ResultsAsync;
+        return result.Single();
     }
 
     public async Task<List<Movie>> Search(string search)
     {
-        var (queryResults, _) = await _driver
-            .ExecutableQuery(@"
-                MATCH (movie:Movie)
-                WHERE toLower(movie.title) CONTAINS toLower($title)
-                RETURN movie.title AS title,
-                       movie.released AS released,
-                       movie.tagline AS tagline,
-                       movie.votes AS votes")
-            .WithParameters(new { title = search })
-            .WithConfig(_queryConfig)
-            .ExecuteAsync();
+        var query = _client.Cypher
+            .Match("(movie:Movie)")
+            .Where("toLower(movie.title) CONTAINS toLower($title)")
+            .WithParam("title", search)
+            .Return((movie) => new
+            {
+                Title = Return.As<string>("movie.title"),
+                Released = Return.As<long>("movie.released"),
+                Tagline = Return.As<string>("movie.tagline"),
+                Votes = Return.As<long?>("movie.votes")
+            });
 
-        return queryResults
-            .Select(
-                record => new Movie(
-                    record["title"].As<string>(),
-                    Tagline: record["tagline"].As<string>(),
-                    Released: record["released"].As<long>(),
-                    Votes: record["votes"]?.As<long>()))
-            .ToList();
+        var results = await query.ResultsAsync;
+
+        return results.Select(r => new Movie(
+            r.Title,
+            Tagline: r.Tagline,
+            Released: r.Released,
+            Votes: r.Votes
+        )).ToList();
     }
 
     public async Task<D3Graph> FetchD3Graph(int limit)
     {
-        var (queryResults, _) = await _driver
-            .ExecutableQuery(@"
-                MATCH (m:Movie)<-[:ACTED_IN]-(p:Person)
-                WITH m, p
-                ORDER BY m.title, p.name
-                RETURN m.title AS title, collect(p.name) AS cast
-                LIMIT $limit")
-            .WithParameters(new { limit })
-            .WithConfig(_queryConfig)
-            .ExecuteAsync();
+        var query = _client.Cypher
+            .Match("(m:Movie)<-[:ACTED_IN]-(p:Person)")
+            .With("m, p")
+            .OrderBy("m.title, p.name")
+            .Return((m, p) => new 
+            { 
+                Title = Return.As<string>("m.title"), 
+                Cast = Return.As<List<string>>("collect(p.name)") 
+            })
+            .Limit(limit);
 
+        var results = await query.ResultsAsync;
+        
         var nodes = new List<D3Node>();
         var links = new List<D3Link>();
 
-        foreach (var record in queryResults)
+        foreach (var record in results)
         {
-            var movie = new D3Node(record["title"].As<string>(), "movie");
+            var movie = new D3Node(record.Title, "movie");
             var movieIndex = nodes.Count;
             nodes.Add(movie);
-            foreach (var actorName in record["cast"].As<IList<string>>())
+            
+            foreach (var actorName in record.Cast)
             {
                 var actor = new D3Node(actorName, "actor");
                 var actorIndex = nodes.IndexOf(actor);
@@ -132,15 +118,14 @@ public class MovieRepository : IMovieRepository
         return new D3Graph(nodes, links);
     }
 
-    private static IEnumerable<Person> MapCast(IEnumerable<IDictionary<string, object>> persons)
+    private static IEnumerable<Person> MapCast(IEnumerable<dynamic> persons)
     {
         return persons
-            .Select(
-                dictionary =>
-                    new Person(
-                        dictionary["name"].As<string>(),
-                        dictionary["job"].As<string>(),
-                        dictionary["role"].As<string>()))
+            .Select(p => new Person(
+                p["name"].ToString(),
+                p["job"].ToString(),
+                string.Join(", ", p["role"] as IEnumerable<string> ?? Array.Empty<string>())
+            ))
             .ToList();
     }
 }
